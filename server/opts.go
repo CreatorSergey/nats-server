@@ -341,6 +341,12 @@ type MQTTOpts struct {
 	TLSMap bool
 	// Timeout for the TLS handshake
 	TLSTimeout float64
+
+	// AckWait is the amount of time after which a QoS 1 message sent to
+	// a client is redelivered as a DUPLICATE if the server has not
+	// received the PUBACK on the original Packet Identifier.
+	// Note that changes to this option is applied only to new MQTT subscriptions.
+	AckWait time.Duration
 }
 
 type netResolver interface {
@@ -3550,6 +3556,8 @@ func parseMQTT(v interface{}, o *Options, errors *[]error, warnings *[]error) er
 			o.MQTT.AuthTimeout = auth.timeout
 		case "no_auth_user":
 			o.MQTT.NoAuthUser = mv.(string)
+		case "ack_wait", "ackwait":
+			o.MQTT.AckWait = parseDuration("ack_wait", tk, mv, errors, warnings)
 		default:
 			if !tk.IsUsedVariable() {
 				err := &unknownConfigFieldErr{
