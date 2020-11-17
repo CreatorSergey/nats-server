@@ -297,6 +297,8 @@ func TestMQTTParseOptions(t *testing.T) {
 		{"bad tls", `mqtt: { tls: 123 }`, nil, "not map[string]interface {}"},
 		{"unknown field", `mqtt: { this_does_not_exist: 123 }`, nil, "unknown"},
 		{"ack wait", `mqtt: {ack_wait: abc}`, nil, "invalid duration"},
+		{"max ack pending", `mqtt: {max_ack_pending: abc}`, nil, "not int64"},
+		{"max ack pending too high", `mqtt: {max_ack_pending: 12345678}`, nil, "invalid value"},
 		// Positive tests
 		{"tls gen fails", `
 			mqtt {
@@ -390,6 +392,17 @@ func TestMQTTParseOptions(t *testing.T) {
 			`, func(o *MQTTOpts) error {
 				if o.AckWait != 10*time.Second {
 					return fmt.Errorf("Invalid ack wait: %v", o.AckWait)
+				}
+				return nil
+			}, ""},
+		{"max ack pending",
+			`
+			mqtt {
+				max_ack_pending: 123
+			}
+			`, func(o *MQTTOpts) error {
+				if o.MaxAckPending != 123 {
+					return fmt.Errorf("Invalid max ack pending: %v", o.MaxAckPending)
 				}
 				return nil
 			}, ""},
@@ -3452,6 +3465,90 @@ func TestMQTTUnsubscribeWithPendingAcks(t *testing.T) {
 	if pal != 0 {
 		t.Fatalf("Expected pending ack map to be empty, got %v", pal)
 	}
+}
+
+func TestMQTTMaxAckPending(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.MaxAckPending = 1
+	s := testMQTTRunServer(t, o)
+	defer func() {
+		testMQTTShutdownServer(s)
+	}()
+
+	dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, JetStreamStoreDir)
+
+	cisub := &mqttConnInfo{clientID: "sub", cleanSess: false}
+	c, r := testMQTTConnect(t, cisub, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c, r, []*mqttFilter{&mqttFilter{filter: "foo", qos: 1}}, []byte{1})
+
+	cipub := &mqttConnInfo{clientID: "pub", cleanSess: true}
+	cp, rp := testMQTTConnect(t, cipub, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTCheckConnAck(t, rp, mqttConnAckRCConnectionAccepted, false)
+
+	testMQTTPublish(t, cp, rp, 1, false, false, "foo", 1, []byte("msg1"))
+	testMQTTPublish(t, cp, rp, 1, false, false, "foo", 1, []byte("msg2"))
+
+	pi := testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQos1, []byte("msg1"))
+	// Check that we don't receive the second one due to max ack pending
+	testMQTTExpectNothing(t, r)
+
+	// Now ack first message
+	testMQTTSendPubAck(t, c, pi)
+	// Now we should receive message 2
+	testMQTTCheckPubMsg(t, c, r, "foo", mqttPubQos1, []byte("msg2"))
+	testMQTTDisconnect(t, c, nil)
+
+	// Send 2 messages while sub is offline
+	testMQTTPublish(t, cp, rp, 1, false, false, "foo", 1, []byte("msg3"))
+	testMQTTPublish(t, cp, rp, 1, false, false, "foo", 1, []byte("msg4"))
+
+	// Restart consumer
+	c, r = testMQTTConnect(t, cisub, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, true)
+
+	// Should receive only message 3
+	pi = testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQos1, []byte("msg3"))
+	testMQTTExpectNothing(t, r)
+
+	// Ack and get the next
+	testMQTTSendPubAck(t, c, pi)
+	testMQTTCheckPubMsg(t, c, r, "foo", mqttPubQos1, []byte("msg4"))
+
+	// Check that change to config does not prevent restart of sub.
+	cp.Close()
+	c.Close()
+	s.Shutdown()
+
+	o.Port = -1
+	o.MQTT.Port = -1
+	o.MQTT.MaxAckPending = 2
+	o.StoreDir = dir
+	s = testMQTTRunServer(t, o)
+	// There is already the defer for shutdown at top of function
+
+	cp, rp = testMQTTConnect(t, cipub, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTCheckConnAck(t, rp, mqttConnAckRCConnectionAccepted, false)
+
+	testMQTTPublish(t, cp, rp, 1, false, false, "foo", 1, []byte("msg5"))
+	testMQTTPublish(t, cp, rp, 1, false, false, "foo", 1, []byte("msg6"))
+
+	// Restart consumer
+	c, r = testMQTTConnect(t, cisub, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, true)
+
+	// Should receive only message 5
+	pi = testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQos1, []byte("msg5"))
+	testMQTTExpectNothing(t, r)
+
+	// Ack and get the next
+	testMQTTSendPubAck(t, c, pi)
+	testMQTTCheckPubMsg(t, c, r, "foo", mqttPubQos1, []byte("msg6"))
 }
 
 // Benchmarks

@@ -114,7 +114,11 @@ const (
 	// except after client reconnects. However, NATS Server will redeliver
 	// unacknowledged messages after this default interval. This can be
 	// changed with the server.Options.MQTT.AckWait option.
-	mqttDefaultAckWait = time.Hour
+	mqttDefaultAckWait = 30 * time.Second
+
+	// This is the default for the outstanding number of pending QoS 1
+	// messages sent to a session with QoS 1 subscriptions.
+	mqttDefaultMaxAckPending = 1024
 )
 
 var (
@@ -154,6 +158,8 @@ type mqttSession struct {
 	pending  map[uint16]*mqttPending         // Key is the PUBLISH packet identifier sent to client and maps to a mqttPending record
 	cpending map[*Consumer]map[uint64]uint16 // For each JS consumer, the key is the stream sequence and maps to the PUBLISH packet identifier
 	ppi      uint16                          // publish packet identifier
+	maxp     uint16
+	stalled  bool
 	clean    bool
 }
 
@@ -586,6 +592,7 @@ func (sm *mqttSessionManager) getOrCreateAccountSessionManager(clientID string, 
 //
 // Global session manager lock is held on entry.
 func (as *mqttAccountSessionManager) init(acc *Account, c *client) error {
+	opts := c.srv.getOpts()
 	var err error
 	// Start with sessions stream
 	as.sstream, err = acc.LookupStream(mqttSessionsStreamName)
@@ -648,7 +655,8 @@ func (as *mqttAccountSessionManager) init(acc *Account, c *client) error {
 			if ok && es.sseq != 0 {
 				as.sstream.DeleteMsg(es.sseq)
 			} else if !ok {
-				es = &mqttSession{stream: as.sstream}
+				es = mqttSessionCreate(opts)
+				es.stream = as.sstream
 				as.sessions[ps.ID] = es
 			}
 			es.sseq = seq
@@ -883,6 +891,16 @@ func (as *mqttAccountSessionManager) getRetainedPublishMsgs(subject string, rms 
 //
 //////////////////////////////////////////////////////////////////////////////
 
+// Returns a new mqttSession object with max ack pending set based on
+// option or use mqttDefaultMaxAckPending if no option set.
+func mqttSessionCreate(opts *Options) *mqttSession {
+	maxp := opts.MQTT.MaxAckPending
+	if maxp == 0 {
+		maxp = mqttDefaultMaxAckPending
+	}
+	return &mqttSession{maxp: maxp}
+}
+
 // Persists a session. Note that if the session's current client does not match
 // the given client, nothing is done.
 //
@@ -984,9 +1002,21 @@ func (sess *mqttSession) trackPending(pQos byte, reply string, sub *subscription
 	var pi uint16
 
 	bumpPI := func() uint16 {
-		sess.ppi++
-		if sess.ppi == 0 {
-			sess.ppi = 1
+		var avail bool
+		next := sess.ppi
+		for i := 0; i < 0xFFFF; i++ {
+			next++
+			if next == 0 {
+				next = 1
+			}
+			if _, used := sess.pending[next]; !used {
+				sess.ppi = next
+				avail = true
+				break
+			}
+		}
+		if !avail {
+			return 0
 		}
 		return sess.ppi
 	}
@@ -1002,7 +1032,7 @@ func (sess *mqttSession) trackPending(pQos byte, reply string, sub *subscription
 		sess.cpending = make(map[*Consumer]map[uint64]uint16)
 	}
 	// Get the stream sequence and other from the ack reply subject
-	sseq, dseq, dcount, _, _ := sub.mqtt.jsCons.ReplyInfo(reply)
+	sseq, dseq, dcount := ackReplyInfo(reply)
 
 	var pending *mqttPending
 	// For this JS consumer, check to see if we already have sseq->pi
@@ -1016,6 +1046,14 @@ func (sess *mqttSession) trackPending(pQos byte, reply string, sub *subscription
 		pending = sess.pending[pi]
 	}
 	if pi == 0 {
+		// sess.maxp will always have a value > 0.
+		if len(sess.pending) >= int(sess.maxp) {
+			// Indicate that we did not assign a packet identifier.
+			// The caller will not send the message to the subscription
+			// and JS will redeliver later, based on consumer's AckWait.
+			sess.stalled = true
+			return 0, false
+		}
 		pi = bumpPI()
 		sseqToPi[sseq] = pi
 	}
@@ -1297,7 +1335,8 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 	} else {
 		// Spec [MQTT-3.2.2-3]: if the Server does not have stored Session state,
 		// it MUST set Session Present to 0 in the CONNACK packet.
-		es = &mqttSession{c: c, clean: cleanSess, stream: asm.sstream}
+		es = mqttSessionCreate(s.getOpts())
+		es.c, es.clean, es.stream = c, cleanSess, asm.sstream
 		es.mu.Lock()
 		defer es.mu.Unlock()
 		asm.sessions[cp.clientID] = es
@@ -1659,6 +1698,12 @@ func (c *client) mqttProcessPubAck(pi uint16) {
 		if len(sess.pending) == 0 {
 			sess.ppi = 0
 		}
+		if sess.stalled && len(sess.pending) < int(sess.maxp) {
+			sess.stalled = false
+			for _, cons := range sess.cons {
+				cons.forceExpirePending()
+			}
+		}
 	}
 }
 
@@ -1792,6 +1837,13 @@ func mqttDeliverMsgCb(sub *subscription, pc *client, subject, reply string, msg 
 		// This is a QoS1 message for a QoS1 subscription, so get the pi and keep
 		// track of ack subject.
 		pi, dup = sess.trackPending(pQoS, reply, sub)
+		if pi == 0 {
+			// We have reached max pending, don't send the message now.
+			// JS will cause a redelivery and if by then the number of pending
+			// messages has fallen below threshold, the message will be resent.
+			sess.mu.Unlock()
+			return
+		}
 	} else if pc.mqtt != nil {
 		// This is a MQTT publisher...
 		ppFlags = pc.mqtt.pp.flags
@@ -1959,9 +2011,14 @@ func (c *client) mqttProcessJSConsumer(sess *mqttSession, stream *Stream, subjec
 		cons.updateDeliverSubject(inbox)
 	} else {
 		durName := nuid.Next()
-		ackWait := c.srv.getOpts().MQTT.AckWait
+		opts := c.srv.getOpts()
+		ackWait := opts.MQTT.AckWait
 		if ackWait == 0 {
 			ackWait = mqttDefaultAckWait
+		}
+		maxAckPending := opts.MQTT.MaxAckPending
+		if maxAckPending == 0 {
+			maxAckPending = mqttDefaultMaxAckPending
 		}
 		cc := &ConsumerConfig{
 			DeliverSubject: inbox,
@@ -1970,6 +2027,7 @@ func (c *client) mqttProcessJSConsumer(sess *mqttSession, stream *Stream, subjec
 			DeliverPolicy:  DeliverNew,
 			FilterSubject:  subject,
 			AckWait:        ackWait,
+			MaxAckPending:  int(maxAckPending),
 		}
 		cons, err = stream.addConsumerCheckInterest(cc, false)
 		if err != nil {

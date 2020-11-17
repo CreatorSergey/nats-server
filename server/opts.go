@@ -345,8 +345,17 @@ type MQTTOpts struct {
 	// AckWait is the amount of time after which a QoS 1 message sent to
 	// a client is redelivered as a DUPLICATE if the server has not
 	// received the PUBACK on the original Packet Identifier.
+	// The value has to be positive.
+	// Zero will cause the server to use the default value (1 hour).
 	// Note that changes to this option is applied only to new MQTT subscriptions.
 	AckWait time.Duration
+
+	// MaxAckPending is the amount of QoS 1 messages the server can send to
+	// a session without receiving any PUBACK for those messages.
+	// The valid range is [0..65535].
+	// Zero will cause the server to use the default value (1024).
+	// Note that changes to this option is applied only to new MQTT sessions.
+	MaxAckPending uint16
 }
 
 type netResolver interface {
@@ -3558,6 +3567,14 @@ func parseMQTT(v interface{}, o *Options, errors *[]error, warnings *[]error) er
 			o.MQTT.NoAuthUser = mv.(string)
 		case "ack_wait", "ackwait":
 			o.MQTT.AckWait = parseDuration("ack_wait", tk, mv, errors, warnings)
+		case "max_ack_pending", "max_pending", "max_inflight":
+			tmp := int(mv.(int64))
+			if tmp < 0 || tmp > 0xFFFF {
+				err := &configErr{tk, fmt.Sprintf("invalid value %v, should in [0..%d] range", tmp, 0xFFFF)}
+				*errors = append(*errors, err)
+			} else {
+				o.MQTT.MaxAckPending = uint16(tmp)
+			}
 		default:
 			if !tk.IsUsedVariable() {
 				err := &unknownConfigFieldErr{
