@@ -203,7 +203,6 @@ func (m refCountedUrlSet) getAsStringSlice() []string {
 // natsListenConfig.Listen(ctx,...) or use natsListen(); leave calls for HTTP
 // monitoring, etc, on the default.
 var natsListenConfig = &net.ListenConfig{
-	KeepAlive: -1,
 }
 
 // natsListen() is the same as net.Listen() except that TCP keepalives are
@@ -217,7 +216,6 @@ func natsListen(network, address string) (net.Listener, error) {
 func natsDialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
 	d := net.Dialer{
 		Timeout:   timeout,
-		KeepAlive: -1,
 	}
 	return d.Dial(network, address)
 }
