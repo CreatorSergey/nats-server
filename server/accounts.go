@@ -3611,7 +3611,7 @@ func (s *Server) fetch(res AccountResolver, name string) (string, error) {
 
 func NewCacheDirAccResolver(path string, limit int64, ttl time.Duration, _ ...dirJWTStoreOption) (*CacheDirAccResolver, error) {
 	if limit <= 0 {
-		limit = 1_000
+		limit = 1000
 	}
 	store, err := NewExpiringDirJWTStore(path, false, true, HardDelete, 0, limit, true, ttl, nil)
 	if err != nil {
