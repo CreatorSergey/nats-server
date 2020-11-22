@@ -3013,7 +3013,7 @@ func (o *consumerFileStore) encodeState() ([]byte, error) {
 			n += binary.PutUvarint(buf[n:], v.Sequence-adflr)
 			// Downsample to seconds to save on space.
 			// Subsecond resolution not needed for recovery etc.
-			ts := v.Timestamp / 1_000_000_000
+			ts := v.Timestamp / 1000000000
 			n += binary.PutVarint(buf[n:], mints-ts)
 		}
 	}
